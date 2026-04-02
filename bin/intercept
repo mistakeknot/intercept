@@ -8,12 +8,19 @@
 #   intercept backtest <gate-name> --since <duration>
 set -euo pipefail
 
-INTERCEPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+INTERCEPT_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 # Ensure claude is on PATH for haiku dispatch
 export PATH="$HOME/.local/bin:$PATH"
 INTERCEPT_GATES="$INTERCEPT_ROOT/gates"
 INTERCEPT_MODELS="$INTERCEPT_ROOT/models"
-INTERCEPT_LOG="${INTERCEPT_LOG:-${CLAUDE_PROJECT_DIR:-.}/.clavain/intercept/decisions.jsonl}"
+_intercept_project_root() {
+    if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
+        echo "$CLAUDE_PROJECT_DIR"
+    else
+        git rev-parse --show-toplevel 2>/dev/null || echo "."
+    fi
+}
+INTERCEPT_LOG="${INTERCEPT_LOG:-$(_intercept_project_root)/.clavain/intercept/decisions.jsonl}"
 
 # Ensure log directory exists
 mkdir -p "$(dirname "$INTERCEPT_LOG")"
