@@ -1,0 +1,82 @@
+# Convergence Gate — decides whether reaction round fires
+# Replaces: interflux/config/flux-drive/reaction.yaml skip_if_convergence_above threshold
+# Location: interflux/skills/flux-drive/phases/reaction.md Step 2.5.0c
+
+gate:
+  name: convergence-gate
+  description: Should the reaction round fire, or are agents already converged?
+  decisions: [PROCEED, SKIP]
+  default: PROCEED  # fail-open — if everything breaks, reactions still run
+
+input_schema:
+  findings_index_text: string   # full read-indexes output
+  overlap_ratio: float          # from findings-helper.sh convergence
+  total_findings: int
+  overlapping_findings: int
+  agent_count: int
+
+outcome:
+  # interspect event that tells us if the decision was right
+  event: reaction_outcome
+  # how to label: if reactions produced contested findings or reactive additions, PROCEED was correct
+  positive_signal: "json_extract(context, '$.contested_count') > 0 OR json_extract(context, '$.independent_count') > json_extract(context, '$.hearsay_count')"
+  # if reactions produced only hearsay and no contests, SKIP would have been fine
+  negative_signal: "json_extract(context, '$.contested_count') == 0 AND json_extract(context, '$.hearsay_count') >= json_extract(context, '$.independent_count')"
+
+features:
+  # numeric features extracted from input for local model training
+  - name: overlap_ratio
+    source: input.overlap_ratio
+  - name: total_findings
+    source: input.total_findings
+  - name: agent_count
+    source: input.agent_count
+  - name: findings_per_agent_std
+    source: computed  # stddev of per-agent finding counts
+  - name: max_severity
+    source: computed  # 0=no findings, 1=P2 only, 2=P1, 3=P0
+  - name: verdict_entropy
+    source: computed  # entropy of agent verdicts (all safe=0, mixed=high)
+  - name: domain_overlap_ratio
+    source: computed  # fraction of agents sharing a domain keyword
+
+haiku_prompt: |
+  You are the reaction-round gate. Decide whether a reaction round would add value.
+
+  ## Agent Findings Indexes
+
+  {findings_index_text}
+
+  ## Stats
+  - overlap_ratio: {overlap_ratio} (title-normalized, may miss semantic overlap)
+  - total_p0_p1_findings: {total_findings}
+  - overlapping_findings: {overlapping_findings}
+  - agent_count: {agent_count}
+
+  ## Decision Criteria
+
+  Answer PROCEED if ANY of these are true:
+  1. Implicit contradictions: one agent's finding contradicts another's
+  2. Severity disagreement: agents flag the same issue at different severity levels
+  3. Semantic overlap missed by stats: findings about the same underlying issue use different titles
+  4. Domain-expert blind spots: an agent's finding falls in another agent's domain but wasn't reported
+  5. Low confidence signals: any agent's verdict is needs-changes or risky with few findings
+
+  Answer SKIP if ALL of these are true:
+  1. Findings are complementary — each agent reviewed a different domain with no overlap
+  2. No implicit contradictions or severity disagreements exist
+  3. Agents that share a domain agree on what they found
+  4. Reactions would only produce agree stances with no new evidence
+
+  ## Output (strict)
+
+  DECISION: PROCEED | SKIP
+  CONFIDENCE: high | medium | low
+  RATIONALE: [1-2 sentences]
+
+training:
+  min_decisions: 50           # don't train until this many logged decisions
+  retrain_interval: 25        # retrain every N new decisions
+  promote_threshold: 0.90     # accuracy vs haiku before promoting local model
+  canary_window: 20           # after promotion, shadow-run haiku for N decisions
+  canary_max_divergence: 0.15 # revert to haiku if divergence exceeds this

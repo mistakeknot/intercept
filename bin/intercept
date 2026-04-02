@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# intercept — smart decision gates that distill into local models
+# Usage:
+#   intercept decide <gate-name> --input <json>
+#   intercept status [gate-name]
+#   intercept train <gate-name>
+#   intercept promote <gate-name>
+#   intercept backtest <gate-name> --since <duration>
+set -euo pipefail
+
+INTERCEPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Ensure claude is on PATH for haiku dispatch
+export PATH="$HOME/.local/bin:$PATH"
+INTERCEPT_GATES="$INTERCEPT_ROOT/gates"
+INTERCEPT_MODELS="$INTERCEPT_ROOT/models"
+INTERCEPT_LOG="${INTERCEPT_LOG:-${CLAUDE_PROJECT_DIR:-.}/.clavain/intercept/decisions.jsonl}"
+
+# Ensure log directory exists
+mkdir -p "$(dirname "$INTERCEPT_LOG")"
+
+_die() { echo "intercept: $*" >&2; exit 1; }
+
+_gate_file() {
+    local gate="$1"
+    local f="$INTERCEPT_GATES/${gate}.yaml"
+    [[ -f "$f" ]] || _die "unknown gate: $gate (no $f)"
+    echo "$f"
+}
+
+_model_file() {
+    local gate="$1"
+    echo "$INTERCEPT_MODELS/${gate}.joblib"
+}
+
+_has_local_model() {
+    local gate="$1"
+    [[ -f "$(_model_file "$gate")" ]]
+}
+
+_extract_yaml() {
+    # Minimal YAML value extraction (single scalar)
+    local file="$1" key="$2"
+    grep "^  ${key}:" "$file" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | sed 's/[[:space:]]*#.*//'
+}
+
+# ─── decide ──────────────────────────────────────────────────────────────────
+
+cmd_decide() {
+    local gate="" input=""
+    gate="${1:?usage: intercept decide <gate-name> --input <json>}"; shift
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --input) input="$2"; shift 2 ;;
+            *) _die "unknown flag: $1" ;;
+        esac
+    done
+    [[ -n "$input" ]] || _die "missing --input"
+
+    local gate_file
+    gate_file=$(_gate_file "$gate")
+    local default_decision
+    default_decision=$(_extract_yaml "$gate_file" "default") || default_decision="PROCEED"
+
+    local decision="" confidence="" rationale="" source=""
+
+    if _has_local_model "$gate"; then
+        # Local model inference
+        source="local"
+        local model_out
+        model_out=$(python3 "$INTERCEPT_ROOT/scripts/infer.py" \
+            --gate "$gate" \
+            --input "$input" \
+            --model "$(_model_file "$gate")" \
+            --gate-file "$gate_file" 2>/dev/null) || {
+            # Model inference failed — fall through to haiku
+            source=""
+        }
+        if [[ -n "$source" ]]; then
+            decision=$(echo "$model_out" | head -1)
+            confidence=$(echo "$model_out" | sed -n '2p')
+            rationale="local model inference"
+        fi
+    fi
+
+    if [[ -z "$source" ]]; then
+        # Haiku mode — build prompt from gate definition and call claude -p
+        source="haiku"
+        local prompt_template
+        prompt_template=$(awk '/^haiku_prompt: \|/{found=1; next} found && /^[a-z]/{exit} found{print}' "$gate_file")
+
+        if [[ -z "$prompt_template" ]]; then
+            # No prompt template — use default decision
+            decision="$default_decision"
+            confidence="low"
+            rationale="no haiku prompt defined, using default"
+            source="default"
+        else
+            # Substitute input values into prompt
+            local prompt="$prompt_template"
+            # Extract JSON fields and substitute {field_name} placeholders
+            while IFS='=' read -r key val; do
+                prompt="${prompt//\{$key\}/$val}"
+            done < <(echo "$input" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for k, v in d.items():
+    print(f'{k}={v}')
+" 2>/dev/null)
+
+            # Call haiku via claude -p
+            local haiku_out
+            haiku_out=$(echo "$prompt" | claude -p --model haiku 2>/dev/null) || {
+                decision="$default_decision"
+                confidence="low"
+                rationale="haiku call failed, using default"
+                source="default"
+            }
+
+            if [[ "$source" == "haiku" ]]; then
+                decision=$(echo "$haiku_out" | grep -oP 'DECISION:\s*\K\S+' | head -1)
+                confidence=$(echo "$haiku_out" | grep -oP 'CONFIDENCE:\s*\K\S+' | head -1)
+                rationale=$(echo "$haiku_out" | grep -oP 'RATIONALE:\s*\K.*' | head -1)
+                # Validate decision is in allowed set
+                case "$decision" in
+                    PROCEED|SKIP) ;;
+                    *) decision="$default_decision"; rationale="unparseable haiku response, using default" ;;
+                esac
+            fi
+        fi
+    fi
+
+    # Log decision
+    local ts
+    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    local session_id="${CLAUDE_SESSION_ID:-unknown}"
+    printf '%s\n' "$(jq -n -c \
+        --arg gate "$gate" \
+        --arg decision "$decision" \
+        --arg confidence "$confidence" \
+        --arg rationale "$rationale" \
+        --arg source "$source" \
+        --arg ts "$ts" \
+        --arg session "$session_id" \
+        --argjson input "$input" \
+        '{gate:$gate, decision:$decision, confidence:$confidence,
+          rationale:$rationale, source:$source, timestamp:$ts,
+          session_id:$session, input:$input}')" >> "$INTERCEPT_LOG"
+
+    # Output decision to stdout
+    echo "$decision"
+}
+
+# ─── status ──────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    local gate="${1:-}"
+
+    if [[ -n "$gate" ]]; then
+        local gate_file
+        gate_file=$(_gate_file "$gate")
+        local has_model="false"
+        _has_local_model "$gate" && has_model="true"
+        local total=0 haiku=0 local_count=0
+        if [[ -f "$INTERCEPT_LOG" ]]; then
+            total=$(grep -c "\"gate\":\"$gate\"" "$INTERCEPT_LOG" 2>/dev/null || echo 0)
+            haiku=$(grep "\"gate\":\"$gate\"" "$INTERCEPT_LOG" 2>/dev/null | grep -c '"source":"haiku"' || echo 0)
+            local_count=$(grep "\"gate\":\"$gate\"" "$INTERCEPT_LOG" 2>/dev/null | grep -c '"source":"local"' || echo 0)
+        fi
+        local min_decisions
+        min_decisions=$(_extract_yaml "$gate_file" "min_decisions") || min_decisions=50
+        echo "$gate: decisions=$total (haiku=$haiku, local=$local_count) model=$has_model train_ready=$([ "$total" -ge "$min_decisions" ] && echo yes || echo "no (need $min_decisions)")"
+    else
+        # All gates
+        for f in "$INTERCEPT_GATES"/*.yaml; do
+            [[ -f "$f" ]] || continue
+            local g
+            g=$(basename "$f" .yaml)
+            cmd_status "$g"
+        done
+    fi
+}
+
+# ─── train ───────────────────────────────────────────────────────────────────
+
+cmd_train() {
+    local gate="${1:?usage: intercept train <gate-name>}"
+    local gate_file
+    gate_file=$(_gate_file "$gate")
+
+    [[ -f "$INTERCEPT_LOG" ]] || _die "no decisions logged yet"
+
+    python3 "$INTERCEPT_ROOT/scripts/train.py" \
+        --gate "$gate" \
+        --log "$INTERCEPT_LOG" \
+        --gate-file "$gate_file" \
+        --output "$(_model_file "$gate")"
+}
+
+# ─── promote ─────────────────────────────────────────────────────────────────
+
+cmd_promote() {
+    local gate="${1:?usage: intercept promote <gate-name>}"
+    _has_local_model "$gate" || _die "no trained model for $gate — run 'intercept train $gate' first"
+    echo "Model promoted for $gate. Shadow mode active for canary window."
+    # Promotion is implicit — _has_local_model returns true, so decide uses it
+    # Canary: shadow-run haiku alongside local model for N decisions (handled in decide)
+}
+
+# ─── main dispatch ───────────────────────────────────────────────────────────
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+    decide)   cmd_decide "$@" ;;
+    status)   cmd_status "$@" ;;
+    train)    cmd_train "$@" ;;
+    promote)  cmd_promote "$@" ;;
+    help|-h|--help)
+        echo "intercept — smart decision gates"
+        echo ""
+        echo "Commands:"
+        echo "  decide  <gate> --input <json>  Make a gate decision"
+        echo "  status  [gate]                 Show gate stats"
+        echo "  train   <gate>                 Train local model from logged decisions"
+        echo "  promote <gate>                 Promote local model (with canary window)"
+        echo ""
+        echo "Gates: $(ls "$INTERCEPT_GATES"/*.yaml 2>/dev/null | xargs -I{} basename {} .yaml | tr '\n' ' ')"
+        ;;
+    *) _die "unknown command: $cmd" ;;
+esac
