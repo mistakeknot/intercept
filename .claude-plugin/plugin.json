@@ -1,9 +1,8 @@
 {
   "name": "intercept",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Smart decision gates — haiku LLM decisions that distill into local models over time",
   "commands": [],
   "skills": [],
-  "agents": [],
-  "hooks": {}
+  "agents": []
 }
