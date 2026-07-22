@@ -1,238 +1,150 @@
-#!/usr/bin/env bash
-# intercept — smart decision gates that distill into local models
-# Usage:
-#   intercept decide <gate-name> --input <json>
-#   intercept status [gate-name]
-#   intercept train <gate-name>
-#   intercept promote <gate-name>
-#   intercept backtest <gate-name> --since <duration>
-set -euo pipefail
+#!/usr/bin/env python3
+"""intercept — adaptive, fail-open decision gates."""
 
-INTERCEPT_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-# Ensure claude is on PATH for haiku dispatch
-export PATH="$HOME/.local/bin:$PATH"
-INTERCEPT_GATES="$INTERCEPT_ROOT/gates"
-INTERCEPT_MODELS="$INTERCEPT_ROOT/models"
-_intercept_project_root() {
-    if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
-        echo "$CLAUDE_PROJECT_DIR"
-    else
-        git rev-parse --show-toplevel 2>/dev/null || echo "."
-    fi
-}
-INTERCEPT_LOG="${INTERCEPT_LOG:-$(_intercept_project_root)/.clavain/intercept/decisions.jsonl}"
+from __future__ import annotations
 
-# Ensure log directory exists
-mkdir -p "$(dirname "$INTERCEPT_LOG")"
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
 
-_die() { echo "intercept: $*" >&2; exit 1; }
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
 
-_gate_file() {
-    local gate="$1"
-    local f="$INTERCEPT_GATES/${gate}.yaml"
-    [[ -f "$f" ]] || _die "unknown gate: $gate (no $f)"
-    echo "$f"
-}
+from intercept_core import (  # noqa: E402
+    ALLOWED_DECISIONS,
+    append_jsonl,
+    backtest_gate,
+    decide,
+    gate_path,
+    promote_gate,
+    read_jsonl,
+    runtime_paths,
+    status_gate,
+    train_gate,
+    utc_now,
+    warn,
+)
 
-_model_file() {
-    local gate="$1"
-    echo "$INTERCEPT_MODELS/${gate}.joblib"
-}
+VERSION = "0.2.0"
 
-_has_local_model() {
-    local gate="$1"
-    [[ -f "$(_model_file "$gate")" ]]
-}
 
-_extract_yaml() {
-    # Minimal YAML value extraction (single scalar)
-    local file="$1" key="$2"
-    grep "^  ${key}:" "$file" 2>/dev/null | head -1 | sed 's/^[^:]*:[[:space:]]*//' | sed 's/[[:space:]]*#.*//'
-}
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="intercept",
+        description="Adaptive decision gates: Haiku/default teacher -> shadow canary -> local classifier.",
+    )
+    parser.add_argument("--version", action="version", version=f"intercept {VERSION}")
+    subparsers = parser.add_subparsers(dest="command")
 
-# ─── decide ──────────────────────────────────────────────────────────────────
+    decide_parser = subparsers.add_parser(
+        "decide", help="make and log a fail-open production decision"
+    )
+    decide_parser.add_argument("gate")
+    decide_parser.add_argument("--input", required=True, help="JSON object")
 
-cmd_decide() {
-    local gate="" input=""
-    gate="${1:?usage: intercept decide <gate-name> --input <json>}"; shift
+    label_parser = subparsers.add_parser(
+        "label", help="append an explicit outcome label for a decision ID"
+    )
+    label_parser.add_argument("gate")
+    label_parser.add_argument("decision_id")
+    label_parser.add_argument("label", choices=ALLOWED_DECISIONS)
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --input) input="$2"; shift 2 ;;
-            *) _die "unknown flag: $1" ;;
-        esac
-    done
-    [[ -n "$input" ]] || _die "missing --input"
+    train_parser = subparsers.add_parser(
+        "train", help="train and evaluate an inactive JSON candidate model"
+    )
+    train_parser.add_argument("gate")
 
-    local gate_file
-    gate_file=$(_gate_file "$gate")
-    local default_decision
-    default_decision=$(_extract_yaml "$gate_file" "default") || default_decision="PROCEED"
+    promote_parser = subparsers.add_parser(
+        "promote", help="verify candidate accuracy and begin persisted shadow canary"
+    )
+    promote_parser.add_argument("gate")
 
-    local decision="" confidence="" rationale="" source=""
+    backtest_parser = subparsers.add_parser(
+        "backtest", help="evaluate candidate/active model against explicit-or-teacher labels"
+    )
+    backtest_parser.add_argument("gate")
+    backtest_parser.add_argument("--since", help="lookback such as 30m, 12h, 7d, or 2w")
 
-    if _has_local_model "$gate"; then
-        # Local model inference
-        source="local"
-        local model_out
-        model_out=$(python3 "$INTERCEPT_ROOT/scripts/infer.py" \
-            --gate "$gate" \
-            --input "$input" \
-            --model "$(_model_file "$gate")" \
-            --gate-file "$gate_file" 2>/dev/null) || {
-            # Model inference failed — fall through to haiku
-            source=""
-        }
-        if [[ -n "$source" ]]; then
-            decision=$(echo "$model_out" | head -1)
-            confidence=$(echo "$model_out" | sed -n '2p')
-            rationale="local model inference"
-        fi
-    fi
+    status_parser = subparsers.add_parser(
+        "status", help="show truthful counts, model lifecycle, metrics, and canary progress"
+    )
+    status_parser.add_argument("gate", nargs="?")
+    return parser
 
-    if [[ -z "$source" ]]; then
-        # Haiku mode — build prompt from gate definition and call claude -p
-        source="haiku"
-        local prompt_template
-        prompt_template=$(awk '/^haiku_prompt: \|/{found=1; next} found && /^[a-z]/{exit} found{print}' "$gate_file")
 
-        if [[ -z "$prompt_template" ]]; then
-            # No prompt template — use default decision
-            decision="$default_decision"
-            confidence="low"
-            rationale="no haiku prompt defined, using default"
-            source="default"
-        else
-            # Substitute input values into prompt
-            local prompt="$prompt_template"
-            # Extract JSON fields and substitute {field_name} placeholders
-            while IFS='=' read -r key val; do
-                prompt="${prompt//\{$key\}/$val}"
-            done < <(echo "$input" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-for k, v in d.items():
-    print(f'{k}={v}')
-" 2>/dev/null)
+def command_label(gate: str, decision_id: str, label: str) -> dict[str, str]:
+    gate_path(gate)
+    paths = runtime_paths(gate)
+    matching = [
+        row
+        for row in read_jsonl(paths["decisions"])
+        if row.get("gate") == gate and str(row.get("decision_id")) == decision_id
+    ]
+    if not matching:
+        raise ValueError(f"decision ID {decision_id} was not found for gate {gate}")
+    record = {
+        "gate": gate,
+        "decision_id": decision_id,
+        "label": label,
+        "timestamp": utc_now(),
+        "source": "explicit",
+    }
+    append_jsonl(paths["labels"], record)
+    return record
 
-            # Call haiku via claude -p
-            local haiku_out
-            haiku_out=$(echo "$prompt" | claude -p --model haiku 2>/dev/null) || {
-                decision="$default_decision"
-                confidence="low"
-                rationale="haiku call failed, using default"
-                source="default"
-            }
 
-            if [[ "$source" == "haiku" ]]; then
-                decision=$(echo "$haiku_out" | grep -oP 'DECISION:\s*\K\S+' | head -1)
-                confidence=$(echo "$haiku_out" | grep -oP 'CONFIDENCE:\s*\K\S+' | head -1)
-                rationale=$(echo "$haiku_out" | grep -oP 'RATIONALE:\s*\K.*' | head -1)
-                # Validate decision is in allowed set
-                case "$decision" in
-                    PROCEED|SKIP) ;;
-                    *) decision="$default_decision"; rationale="unparseable haiku response, using default" ;;
-                esac
-            fi
-        fi
-    fi
+def command_status(gate: str | None) -> None:
+    if gate:
+        print(json.dumps(status_gate(gate), sort_keys=True))
+        return
+    gates_dir = Path(os.environ.get("INTERCEPT_GATES", ROOT / "gates"))
+    for path in sorted(gates_dir.glob("*.yaml")):
+        print(json.dumps(status_gate(path.stem, path), sort_keys=True))
 
-    # Log decision
-    local ts
-    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    local session_id="${CLAUDE_SESSION_ID:-unknown}"
-    printf '%s\n' "$(jq -n -c \
-        --arg gate "$gate" \
-        --arg decision "$decision" \
-        --arg confidence "$confidence" \
-        --arg rationale "$rationale" \
-        --arg source "$source" \
-        --arg ts "$ts" \
-        --arg session "$session_id" \
-        --argjson input "$input" \
-        '{gate:$gate, decision:$decision, confidence:$confidence,
-          rationale:$rationale, source:$source, timestamp:$ts,
-          session_id:$session, input:$input}')" >> "$INTERCEPT_LOG"
 
-    # Output decision to stdout
-    echo "$decision"
-}
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return 0
 
-# ─── status ──────────────────────────────────────────────────────────────────
+    if args.command == "decide":
+        # This command is a caller safety boundary: never let runtime/model/LLM
+        # failures turn a fail-open gate into a blocked caller.
+        try:
+            output = decide(args.gate, args.input)
+        except Exception as exc:
+            warn(f"fatal decision error ({exc}); using fail-open PROCEED")
+            output = "PROCEED"
+        print(output)
+        return 0
 
-cmd_status() {
-    local gate="${1:-}"
+    try:
+        if args.command == "label":
+            print(json.dumps(command_label(args.gate, args.decision_id, args.label), sort_keys=True))
+        elif args.command == "train":
+            path = gate_path(args.gate)
+            paths = runtime_paths(args.gate)
+            metrics = train_gate(
+                args.gate, paths["decisions"], path, paths["candidate"], paths["labels"]
+            )
+            print(json.dumps(metrics, sort_keys=True))
+        elif args.command == "promote":
+            print(json.dumps(promote_gate(args.gate), sort_keys=True))
+        elif args.command == "backtest":
+            print(json.dumps(backtest_gate(args.gate, args.since), sort_keys=True))
+        elif args.command == "status":
+            command_status(args.gate)
+        else:
+            parser.error(f"unknown command {args.command}")
+    except Exception as exc:
+        print(f"intercept {args.command}: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
-    if [[ -n "$gate" ]]; then
-        local gate_file
-        gate_file=$(_gate_file "$gate")
-        local has_model="false"
-        _has_local_model "$gate" && has_model="true"
-        local total=0 haiku=0 local_count=0
-        if [[ -f "$INTERCEPT_LOG" ]]; then
-            total=$(grep -c "\"gate\":\"$gate\"" "$INTERCEPT_LOG" 2>/dev/null || echo 0)
-            haiku=$(grep "\"gate\":\"$gate\"" "$INTERCEPT_LOG" 2>/dev/null | grep -c '"source":"haiku"' || echo 0)
-            local_count=$(grep "\"gate\":\"$gate\"" "$INTERCEPT_LOG" 2>/dev/null | grep -c '"source":"local"' || echo 0)
-        fi
-        local min_decisions
-        min_decisions=$(_extract_yaml "$gate_file" "min_decisions") || min_decisions=50
-        echo "$gate: decisions=$total (haiku=$haiku, local=$local_count) model=$has_model train_ready=$([ "$total" -ge "$min_decisions" ] && echo yes || echo "no (need $min_decisions)")"
-    else
-        # All gates
-        for f in "$INTERCEPT_GATES"/*.yaml; do
-            [[ -f "$f" ]] || continue
-            local g
-            g=$(basename "$f" .yaml)
-            cmd_status "$g"
-        done
-    fi
-}
 
-# ─── train ───────────────────────────────────────────────────────────────────
-
-cmd_train() {
-    local gate="${1:?usage: intercept train <gate-name>}"
-    local gate_file
-    gate_file=$(_gate_file "$gate")
-
-    [[ -f "$INTERCEPT_LOG" ]] || _die "no decisions logged yet"
-
-    python3 "$INTERCEPT_ROOT/scripts/train.py" \
-        --gate "$gate" \
-        --log "$INTERCEPT_LOG" \
-        --gate-file "$gate_file" \
-        --output "$(_model_file "$gate")"
-}
-
-# ─── promote ─────────────────────────────────────────────────────────────────
-
-cmd_promote() {
-    local gate="${1:?usage: intercept promote <gate-name>}"
-    _has_local_model "$gate" || _die "no trained model for $gate — run 'intercept train $gate' first"
-    echo "Model promoted for $gate. Shadow mode active for canary window."
-    # Promotion is implicit — _has_local_model returns true, so decide uses it
-    # Canary: shadow-run haiku alongside local model for N decisions (handled in decide)
-}
-
-# ─── main dispatch ───────────────────────────────────────────────────────────
-
-cmd="${1:-help}"; shift || true
-
-case "$cmd" in
-    decide)   cmd_decide "$@" ;;
-    status)   cmd_status "$@" ;;
-    train)    cmd_train "$@" ;;
-    promote)  cmd_promote "$@" ;;
-    help|-h|--help)
-        echo "intercept — smart decision gates"
-        echo ""
-        echo "Commands:"
-        echo "  decide  <gate> --input <json>  Make a gate decision"
-        echo "  status  [gate]                 Show gate stats"
-        echo "  train   <gate>                 Train local model from logged decisions"
-        echo "  promote <gate>                 Promote local model (with canary window)"
-        echo ""
-        echo "Gates: $(ls "$INTERCEPT_GATES"/*.yaml 2>/dev/null | xargs -I{} basename {} .yaml | tr '\n' ' ')"
-        ;;
-    *) _die "unknown command: $cmd" ;;
-esac
+if __name__ == "__main__":
+    raise SystemExit(main())

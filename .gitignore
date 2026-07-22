@@ -1,3 +1,10 @@
-models/*.joblib
-models/*.json
-models/*.csv
+# Deployment-local adaptive runtime artifacts
+models/
+states/
+.clavain/
+*.jsonl
+
+# Python/test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
