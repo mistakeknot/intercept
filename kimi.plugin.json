@@ -1,0 +1,9 @@
+{
+  "name": "intercept",
+  "version": "0.2.0",
+  "description": "Adaptive fail-open decision gates with explicit labels, inspectable local classifiers, and metric-gated shadow canaries",
+  "interface": {
+    "displayName": "intercept",
+    "shortDescription": "Adaptive fail-open decision gates with explicit labels, inspectable local classifiers, and metric-gated shadow canaries"
+  }
+}
